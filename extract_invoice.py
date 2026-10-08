@@ -2,7 +2,15 @@ import re
 from pathlib import Path
 
 import pdfplumber
+import pytesseract
 from openpyxl import Workbook
+from PIL import Image, ImageOps
+
+WINDOWS_TESSERACT = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+if WINDOWS_TESSERACT.exists():
+    pytesseract.pytesseract.tesseract_cmd = str(WINDOWS_TESSERACT)
+
+IMAGE_TYPES = {".jpg", ".jpeg", ".png"}
 
 MONEY = r"(?:[$€£]\s?\d[\d,]*\.\d{2})|(?:\d[\d,]*\.\d{2}\s?[$€£])"
 MONTH = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?"
@@ -22,12 +30,18 @@ def last_money(line):
 
 
 def find_amount(lines, labels):
-    pattern = rf"^\s*(?:{labels})\b"
+    start_of_line = rf"^\s*(?:{labels})\b"
     for line in lines:
-        if re.search(pattern, line, re.IGNORECASE):
+        if re.search(start_of_line, line, re.IGNORECASE):
             value = last_money(line)
             if value:
                 return value
+    # OCR sometimes glues columns together, so the label may be in the middle of a line
+    inside_line = rf"(?<![A-Za-z])(?<!Sub )(?<!Sub)(?:{labels})\b[^$€£\d]*({MONEY})"
+    for line in lines:
+        match = re.search(inside_line, line, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
     return ""
 
 
@@ -52,13 +66,19 @@ def find_date(text):
     return min(candidates)[1] if candidates else ""
 
 
+def looks_like_text(line):
+    letters = sum(ch.isalpha() for ch in line)
+    return letters >= 5 and letters / max(len(line.strip()), 1) >= 0.6
+
+
 def find_company(lines):
     for i, line in enumerate(lines):
         if line.strip() == "From:" and i + 1 < len(lines):
             return lines[i + 1].split(" Order Number")[0].strip()
     for line in lines:
-        if line.strip() and line.strip().lower() not in GENERIC_TITLES:
-            return line.strip()
+        name = re.sub(r"\s+(Tax Invoice|Invoice)$", "", line.strip(), flags=re.IGNORECASE)
+        if looks_like_text(name) and name.lower() not in GENERIC_TITLES:
+            return name
     return ""
 
 
@@ -85,15 +105,40 @@ def parse_invoice(text, file_name):
     }
 
 
+def ocr_image(image):
+    image = ImageOps.grayscale(image)
+    if image.width < 1600:
+        scale = 1600 / image.width
+        image = image.resize((int(image.width * scale), int(image.height * scale)))
+    return pytesseract.image_to_string(image, config="--psm 6")
+
+
 def read_pdf(pdf_path):
     with pdfplumber.open(pdf_path) as pdf:
-        return "\n".join(page.extract_text() or "" for page in pdf.pages)
+        text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+        if len(text.strip()) >= 30:
+            return text
+        # no selectable text: this is a scan, read it with OCR
+        return "\n".join(ocr_image(page.to_image(resolution=300).original) for page in pdf.pages)
+
+
+def read_file(path):
+    if path.suffix.lower() == ".pdf":
+        return read_pdf(path)
+    return ocr_image(Image.open(path))
 
 
 if __name__ == "__main__":
     rows = []
-    for pdf_path in sorted(Path("invoices").glob("*.pdf")):
-        row = parse_invoice(read_pdf(pdf_path), pdf_path.name)
+    files = [p for p in sorted(Path("invoices").iterdir())
+             if p.suffix.lower() == ".pdf" or p.suffix.lower() in IMAGE_TYPES]
+    for pdf_path in files:
+        try:
+            text = read_file(pdf_path)
+        except pytesseract.TesseractNotFoundError:
+            print("Не найдена программа Tesseract OCR. Установи её (см. инструкцию) и запусти снова.")
+            raise SystemExit(1)
+        row = parse_invoice(text, pdf_path.name)
         missing = [k for k, v in row.items() if not v]
         if missing:
             print(f"ВНИМАНИЕ: в {pdf_path.name} не найдено: {', '.join(missing)}")
